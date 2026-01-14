@@ -21,10 +21,11 @@ MQTT_PASSWORD = None
 
 HA_DISCOVERY_PREFIX = "homeassistant"
 BASE_TOPIC = "delta"
+DEVICE_ID = "delta_exchange_wallet"
 # ===============================================
 
 
-# ---------- HELPERS ----------
+# ---------- AUTH ----------
 def sign(secret, message):
     return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
@@ -41,6 +42,7 @@ def auth_headers(method, path):
     }
 
 
+# ---------- API ----------
 def fetch_balances():
     path = "/v2/wallet/balances"
     r = requests.get(
@@ -59,7 +61,7 @@ def safe_float(v):
         return 0.0
 
 
-# ================= MQTT INIT (paho v2 FIX) =================
+# ================= MQTT INIT (v2.x SAFE) =================
 mqttc = mqtt.Client(
     client_id="delta_wallet",
     callback_api_version=mqtt.CallbackAPIVersion.VERSION1
@@ -72,46 +74,33 @@ mqttc.connect(MQTT_BROKER, MQTT_PORT, 60)
 mqttc.loop_start()
 
 
-# ================= HOME ASSISTANT DISCOVERY =================
-def ha_sensor(object_id, name, unit=None, device_class=None):
+# ---------- HOME ASSISTANT SENSOR ----------
+def ha_sensor(object_id, name, unit=None):
     topic = f"{HA_DISCOVERY_PREFIX}/sensor/delta/{object_id}/config"
 
     payload = {
         "name": name,
         "state_topic": f"{BASE_TOPIC}/{object_id}",
-        "unique_id": f"delta_{object_id}",
-        "value_template": "{{ value | float }}",
-        "state_class": "measurement",
+        "unique_id": f"{DEVICE_ID}_{object_id}",
+        "state_class": "measurement",  # ⭐ enables history & graph
         "device": {
-            "identifiers": ["delta_exchange"],
+            "identifiers": [DEVICE_ID],
             "name": "Delta Exchange Wallet",
             "manufacturer": "Delta Exchange",
-            "model": "Wallet API"
+            "model": "Wallet API",
+            "sw_version": "1.0"
         }
     }
 
     if unit:
         payload["unit_of_measurement"] = unit
-    if device_class:
-        payload["device_class"] = device_class
 
     mqttc.publish(topic, json.dumps(payload), retain=True)
 
 
 # ---------- META SENSORS ----------
-ha_sensor(
-    "net_equity",
-    "Delta Net Equity",
-    unit="INR",
-    device_class="monetary"
-)
-
-ha_sensor(
-    "robo_trading_equity",
-    "Delta Robo Trading Equity",
-    unit="INR",
-    device_class="monetary"
-)
+ha_sensor("net_equity", "Delta Net Equity", "USD")
+ha_sensor("robo_trading_equity", "Delta Robo Trading Equity", "USD")
 
 
 # ================= MAIN LOOP =================
@@ -124,17 +113,17 @@ while True:
 
         mqttc.publish(
             f"{BASE_TOPIC}/net_equity",
-            f"{safe_float(meta.get('net_equity')):.2f}",
+            safe_float(meta.get("net_equity")),
             retain=True
         )
 
         mqttc.publish(
             f"{BASE_TOPIC}/robo_trading_equity",
-            f"{safe_float(meta.get('robo_trading_equity')):.2f}",
+            safe_float(meta.get("robo_trading_equity")),
             retain=True
         )
 
-        # ---------- ASSET SENSORS ----------
+        # ---------- WALLET ASSETS ----------
         for b in data.get("result", []):
             asset = b.get("asset_symbol", "").lower()
 
@@ -145,16 +134,19 @@ while True:
                 sensor_id = f"{asset}_{key}"
                 sensor_name = f"{asset.upper()} {key.replace('_', ' ').title()}"
 
-                # Auto-discovery (safe to repeat)
-                ha_sensor(
-                    sensor_id,
-                    sensor_name,
-                    unit=asset.upper() if "balance" in key else None
-                )
+                # ---------- UNIT LOGIC ----------
+                unit = None
+                if key in ("balance", "available_balance", "reserved_balance"):
+                    unit = asset.upper()
+                elif "equity" in key or "margin" in key or "value" in key:
+                    unit = "USD"
+
+                # Auto discovery (safe repeat)
+                ha_sensor(sensor_id, sensor_name, unit)
 
                 mqttc.publish(
                     f"{BASE_TOPIC}/{sensor_id}",
-                    f"{safe_float(val):.8f}",
+                    safe_float(val),
                     retain=True
                 )
 
